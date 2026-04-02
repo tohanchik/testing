@@ -1,0 +1,23 @@
+Detailed inventory tuning mode is disabled by default.
+
+How to enable/disable it at runtime (no code edit needed):
+1) Open/create this file on your PSP storage:
+   ms0:/PSP/GAME/MinecraftPSP/inv_tune_mode.cfg
+2) Put exactly one value inside:
+   true
+   or
+   false
+3) Start the game (the value is read on startup).
+
+How to enter/exit tuning mode (when enabled):
+- Open creative inventory.
+- Hold L + R + SELECT.
+- While holding them, press TRIANGLE.
+
+How to switch tuning target (when enabled):
+- Press SELECT to cycle:
+  GRID -> HOTBAR -> DELETE -> TITLE
+
+Notes:
+- This mode is intended only for manual UI alignment/debug.
+- Keep it disabled for normal gameplay builds.
