@@ -33,6 +33,7 @@ private:
   int m_compileStep;
   Chunk *m_compileChunk;
   int m_compileSy;
+  int m_dirtyScanCursor;
   
   Tesselator m_opaqueTess;
   Tesselator m_transTess;

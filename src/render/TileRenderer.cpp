@@ -62,7 +62,7 @@ bool TileRenderer::tesselateCrossInWorld(uint8_t id, int lx, int ly, int lz, int
     blkL = lightTable[bl];
   }
   const float sunScale = m_level->getSunBrightness() * 0.85f + 0.15f;
-  float brightness = (blkL > skyL * sunScale + 0.05f) ? blkL : skyL;
+  float brightness = (blkL > skyL * sunScale) ? blkL : (skyL * sunScale);
   
   uint32_t baseColor = 0xFFFFFFFF;
   // Apply biome green tint for tall grass (vanilla FoliageColor::getDefaultColor)
@@ -429,22 +429,112 @@ bool TileRenderer::tesselateBlockInWorld(uint8_t id, int lx, int ly, int lz, int
   const float eps = 0.125f / 256.0f;
   bool drawn = false;
   bool isFancy = false;
+  const float sunScale = m_level->getSunBrightness() * 0.85f + 0.15f;
+
+  // PHASE 2 (anotherpspport-style fast path):
+  // Use per-face (single-sample) lighting instead of expensive per-vertex smooth AO.
+  // This is intentionally simpler and much cheaper on PSP.
+  const bool kUseLegacyFastLighting = true;
+  if (kUseLegacyFastLighting) {
+    auto sampleFaceLight = [&](int dx, int dy, int dz) -> float {
+      float sky = getSkyLightRaw(lx, ly, lz, cx, cz, dx, dy, dz);
+      uint8_t bl = m_level->getBlockLight(wX + dx, wY + dy, wZ + dz);
+      static const float lightTable[16] = {
+        0.0f, 0.0625f, 0.125f, 0.1875f, 0.25f, 0.3125f, 0.375f, 0.4375f,
+        0.5f, 0.5625f, 0.625f, 0.6875f, 0.75f, 0.8125f, 0.875f, 1.0f
+      };
+      float blk = lightTable[bl & 0x0F];
+      float scaledSky = sky * sunScale;
+      return (blk > scaledSky) ? blk : scaledSky;
+    };
+    auto pickFaceTess = [&](bool fancy) -> Tesselator * {
+      (void)fancy;
+      if (g_blockProps[id].isTransparent()) return m_transTess;
+      return m_opaqueTess;
+    };
+
+    // TOP
+    if (needFace(lx, ly, lz, cx, cz, id, 0, 1, 0, isFancy)) {
+      Tesselator *t = pickFaceTess(isFancy);
+      uint32_t c = applyLightToFace(LIGHT_TOP, sampleFaceLight(0, 1, 0));
+      float u0 = uv.top_x*ts+eps, v0 = uv.top_y*ts+eps;
+      float u1 = (uv.top_x+1)*ts-eps, v1 = (uv.top_y+1)*ts-eps;
+      float off = isFancy ? 0.005f : 0.0f;
+      t->addQuad(u0,v0,u1,v1, c,c,c,c,
+                 wx+off,wy+1-off,wz+off, wx+1-off,wy+1-off,wz+off, wx+off,wy+1-off,wz+1-off, wx+1-off,wy+1-off,wz+1-off);
+      drawn = true;
+    }
+    // BOTTOM
+    if (needFace(lx, ly, lz, cx, cz, id, 0, -1, 0, isFancy)) {
+      Tesselator *t = pickFaceTess(isFancy);
+      uint32_t c = applyLightToFace(LIGHT_BOT, sampleFaceLight(0, -1, 0));
+      float u0=uv.bot_x*ts+eps, v0=uv.bot_y*ts+eps;
+      float u1=(uv.bot_x+1)*ts-eps, v1=(uv.bot_y+1)*ts-eps;
+      float off = isFancy ? 0.005f : 0.0f;
+      t->addQuad(u0,v0,u1,v1, c,c,c,c,
+                 wx+off,wy+off,wz+1-off, wx+1-off,wy+off,wz+1-off, wx+off,wy+off,wz+off, wx+1-off,wy+off,wz+off);
+      drawn = true;
+    }
+    // NORTH
+    if (needFace(lx, ly, lz, cx, cz, id, 0, 0, -1, isFancy)) {
+      Tesselator *t = pickFaceTess(isFancy);
+      uint32_t c = applyLightToFace(LIGHT_SIDE, sampleFaceLight(0, 0, -1));
+      float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
+      float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;
+      float off = isFancy ? 0.005f : 0.0f;
+      t->addQuad(u0,v0,u1,v1, c,c,c,c,
+                 wx+1-off,wy+1-off,wz+off, wx+off,wy+1-off,wz+off, wx+1-off,wy+off,wz+off, wx+off,wy+off,wz+off);
+      drawn = true;
+    }
+    // SOUTH
+    if (needFace(lx, ly, lz, cx, cz, id, 0, 0, 1, isFancy)) {
+      Tesselator *t = pickFaceTess(isFancy);
+      uint32_t c = applyLightToFace(LIGHT_SIDE, sampleFaceLight(0, 0, 1));
+      float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
+      float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;
+      float off = isFancy ? 0.005f : 0.0f;
+      t->addQuad(u0,v0,u1,v1, c,c,c,c,
+                 wx+off,wy+1-off,wz+1-off, wx+1-off,wy+1-off,wz+1-off, wx+off,wy+off,wz+1-off, wx+1-off,wy+off,wz+1-off);
+      drawn = true;
+    }
+    // WEST
+    if (needFace(lx, ly, lz, cx, cz, id, -1, 0, 0, isFancy)) {
+      Tesselator *t = pickFaceTess(isFancy);
+      uint32_t c = applyLightToFace(LIGHT_SIDE, sampleFaceLight(-1, 0, 0));
+      float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
+      float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;
+      float off = isFancy ? 0.005f : 0.0f;
+      t->addQuad(u0,v0,u1,v1, c,c,c,c,
+                 wx+off,wy+1-off,wz+off, wx+off,wy+1-off,wz+1-off, wx+off,wy+off,wz+off, wx+off,wy+off,wz+1-off);
+      drawn = true;
+    }
+    // EAST
+    if (needFace(lx, ly, lz, cx, cz, id, 1, 0, 0, isFancy)) {
+      Tesselator *t = pickFaceTess(isFancy);
+      uint32_t c = applyLightToFace(LIGHT_SIDE, sampleFaceLight(1, 0, 0));
+      float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
+      float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;
+      float off = isFancy ? 0.005f : 0.0f;
+      t->addQuad(u0,v0,u1,v1, c,c,c,c,
+                 wx+1-off,wy+1-off,wz+1-off, wx+1-off,wy+1-off,wz+off, wx+1-off,wy+off,wz+1-off, wx+1-off,wy+off,wz+off);
+      drawn = true;
+    }
+    return drawn;
+  }
 
   // Select tesselator based on lighting
-  const float sunScale = m_level->getSunBrightness() * 0.85f + 0.15f;
   auto pickTess = [&](Tesselator *skyTess, Tesselator *fncTess,
                       float skyL, float blkL, bool fancy) -> Tesselator * {
-    const bool blockDominant = (blkL > skyL * sunScale + 0.05f);
-    if (g_blockProps[id].isTransparent()) {
-      // Transparent cutout blocks (glass/leaves/plants) should still be able to
-      // render in emissive pass when lit by block light, otherwise sun ambient
-      // from trans-pass can make opaque texels look too dark/black at night.
-      if (blockDominant) return m_emitTess;
-      return fancy ? fncTess : m_transTess;
-    }
-    // If block light is dominant, route to emitTess
-    if (blockDominant) return m_emitTess;
+    (void)skyL;
+    (void)blkL;
+    (void)fncTess;
+    (void)fancy;
+    if (g_blockProps[id].isTransparent()) return m_transTess;
     return skyTess;
+  };
+  auto blendLight = [&](float skyL, float blkL) -> float {
+    float scaledSky = skyL * sunScale;
+    return (blkL > scaledSky) ? blkL : scaledSky;
   };
 
   // 4J logic to avoid Z-fighting on inner leaves is handled in per-face code
@@ -463,11 +553,10 @@ bool TileRenderer::tesselateBlockInWorld(uint8_t id, int lx, int ly, int lz, int
     float avgSky = (sl00+sl10+sl01+sl11)*0.25f;
 
     Tesselator *t = pickTess(m_opaqueTess, m_fancyTess, avgSky, avgBlk, isFancy);
-    bool useBlk = (avgBlk > avgSky * sunScale + 0.05f);
-    uint32_t c00 = applyLightToFace(LIGHT_TOP, useBlk ? bl00 : sl00);
-    uint32_t c10 = applyLightToFace(LIGHT_TOP, useBlk ? bl10 : sl10);
-    uint32_t c01 = applyLightToFace(LIGHT_TOP, useBlk ? bl01 : sl01);
-    uint32_t c11 = applyLightToFace(LIGHT_TOP, useBlk ? bl11 : sl11);
+    uint32_t c00 = applyLightToFace(LIGHT_TOP, blendLight(sl00, bl00));
+    uint32_t c10 = applyLightToFace(LIGHT_TOP, blendLight(sl10, bl10));
+    uint32_t c01 = applyLightToFace(LIGHT_TOP, blendLight(sl01, bl01));
+    uint32_t c11 = applyLightToFace(LIGHT_TOP, blendLight(sl11, bl11));
 
     float u0 = uv.top_x*ts+eps, v0 = uv.top_y*ts+eps;
     float u1 = (uv.top_x+1)*ts-eps, v1 = (uv.top_y+1)*ts-eps;
@@ -490,11 +579,10 @@ bool TileRenderer::tesselateBlockInWorld(uint8_t id, int lx, int ly, int lz, int
     float avgBlk=(bl00+bl10+bl01+bl11)*0.25f, avgSky=(sl00+sl10+sl01+sl11)*0.25f;
 
     Tesselator *t = pickTess(m_opaqueTess, m_fancyTess, avgSky, avgBlk, isFancy);
-    bool useBlk = (avgBlk > avgSky * sunScale + 0.05f);
-    uint32_t c00=applyLightToFace(LIGHT_BOT, useBlk?bl00:sl00);
-    uint32_t c10=applyLightToFace(LIGHT_BOT, useBlk?bl10:sl10);
-    uint32_t c01=applyLightToFace(LIGHT_BOT, useBlk?bl01:sl01);
-    uint32_t c11=applyLightToFace(LIGHT_BOT, useBlk?bl11:sl11);
+    uint32_t c00=applyLightToFace(LIGHT_BOT, blendLight(sl00, bl00));
+    uint32_t c10=applyLightToFace(LIGHT_BOT, blendLight(sl10, bl10));
+    uint32_t c01=applyLightToFace(LIGHT_BOT, blendLight(sl01, bl01));
+    uint32_t c11=applyLightToFace(LIGHT_BOT, blendLight(sl11, bl11));
 
     float u0=uv.bot_x*ts+eps, v0=uv.bot_y*ts+eps;
     float u1=(uv.bot_x+1)*ts-eps, v1=(uv.bot_y+1)*ts-eps;
@@ -517,11 +605,10 @@ bool TileRenderer::tesselateBlockInWorld(uint8_t id, int lx, int ly, int lz, int
     float avgBlk=(bl11+bl01+bl10+bl00)*0.25f, avgSky=(sl11+sl01+sl10+sl00)*0.25f;
 
     Tesselator *t=pickTess(m_opaqueTess,m_fancyTess,avgSky,avgBlk,isFancy);
-    bool useBlk=(avgBlk>avgSky*sunScale+0.05f);
-    uint32_t c11=applyLightToFace(LIGHT_SIDE,useBlk?bl11:sl11);
-    uint32_t c01=applyLightToFace(LIGHT_SIDE,useBlk?bl01:sl01);
-    uint32_t c10=applyLightToFace(LIGHT_SIDE,useBlk?bl10:sl10);
-    uint32_t c00=applyLightToFace(LIGHT_SIDE,useBlk?bl00:sl00);
+    uint32_t c11=applyLightToFace(LIGHT_SIDE,blendLight(sl11,bl11));
+    uint32_t c01=applyLightToFace(LIGHT_SIDE,blendLight(sl01,bl01));
+    uint32_t c10=applyLightToFace(LIGHT_SIDE,blendLight(sl10,bl10));
+    uint32_t c00=applyLightToFace(LIGHT_SIDE,blendLight(sl00,bl00));
 
     float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
     float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;
@@ -544,11 +631,10 @@ bool TileRenderer::tesselateBlockInWorld(uint8_t id, int lx, int ly, int lz, int
     float avgBlk=(bl01+bl11+bl00+bl10)*0.25f, avgSky=(sl01+sl11+sl00+sl10)*0.25f;
 
     Tesselator *t=pickTess(m_opaqueTess,m_fancyTess,avgSky,avgBlk,isFancy);
-    bool useBlk=(avgBlk>avgSky*sunScale+0.05f);
-    uint32_t c01=applyLightToFace(LIGHT_SIDE,useBlk?bl01:sl01);
-    uint32_t c11=applyLightToFace(LIGHT_SIDE,useBlk?bl11:sl11);
-    uint32_t c00=applyLightToFace(LIGHT_SIDE,useBlk?bl00:sl00);
-    uint32_t c10=applyLightToFace(LIGHT_SIDE,useBlk?bl10:sl10);
+    uint32_t c01=applyLightToFace(LIGHT_SIDE,blendLight(sl01,bl01));
+    uint32_t c11=applyLightToFace(LIGHT_SIDE,blendLight(sl11,bl11));
+    uint32_t c00=applyLightToFace(LIGHT_SIDE,blendLight(sl00,bl00));
+    uint32_t c10=applyLightToFace(LIGHT_SIDE,blendLight(sl10,bl10));
 
     float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
     float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;
@@ -571,11 +657,10 @@ bool TileRenderer::tesselateBlockInWorld(uint8_t id, int lx, int ly, int lz, int
     float avgBlk=(bl01+bl11+bl00+bl10)*0.25f, avgSky=(sl01+sl11+sl00+sl10)*0.25f;
 
     Tesselator *t=pickTess(m_opaqueTess,m_fancyTess,avgSky,avgBlk,isFancy);
-    bool useBlk=(avgBlk>avgSky*sunScale+0.05f);
-    uint32_t c01=applyLightToFace(LIGHT_SIDE,useBlk?bl01:sl01);
-    uint32_t c11=applyLightToFace(LIGHT_SIDE,useBlk?bl11:sl11);
-    uint32_t c00=applyLightToFace(LIGHT_SIDE,useBlk?bl00:sl00);
-    uint32_t c10=applyLightToFace(LIGHT_SIDE,useBlk?bl10:sl10);
+    uint32_t c01=applyLightToFace(LIGHT_SIDE,blendLight(sl01,bl01));
+    uint32_t c11=applyLightToFace(LIGHT_SIDE,blendLight(sl11,bl11));
+    uint32_t c00=applyLightToFace(LIGHT_SIDE,blendLight(sl00,bl00));
+    uint32_t c10=applyLightToFace(LIGHT_SIDE,blendLight(sl10,bl10));
 
     float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
     float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;
@@ -598,11 +683,10 @@ bool TileRenderer::tesselateBlockInWorld(uint8_t id, int lx, int ly, int lz, int
     float avgBlk=(bl11+bl01+bl10+bl00)*0.25f, avgSky=(sl11+sl01+sl10+sl00)*0.25f;
 
     Tesselator *t=pickTess(m_opaqueTess,m_fancyTess,avgSky,avgBlk,isFancy);
-    bool useBlk=(avgBlk>avgSky*sunScale+0.05f);
-    uint32_t c11=applyLightToFace(LIGHT_SIDE,useBlk?bl11:sl11);
-    uint32_t c01=applyLightToFace(LIGHT_SIDE,useBlk?bl01:sl01);
-    uint32_t c10=applyLightToFace(LIGHT_SIDE,useBlk?bl10:sl10);
-    uint32_t c00=applyLightToFace(LIGHT_SIDE,useBlk?bl00:sl00);
+    uint32_t c11=applyLightToFace(LIGHT_SIDE,blendLight(sl11,bl11));
+    uint32_t c01=applyLightToFace(LIGHT_SIDE,blendLight(sl01,bl01));
+    uint32_t c10=applyLightToFace(LIGHT_SIDE,blendLight(sl10,bl10));
+    uint32_t c00=applyLightToFace(LIGHT_SIDE,blendLight(sl00,bl00));
 
     float u0=uv.side_x*ts+eps, v0=uv.side_y*ts+eps;
     float u1=(uv.side_x+1)*ts-eps, v1=(uv.side_y+1)*ts-eps;

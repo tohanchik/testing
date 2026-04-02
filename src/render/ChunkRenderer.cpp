@@ -9,6 +9,7 @@
 #include <pspgum.h>
 #include <pspkernel.h>
 #include <string.h>
+#include <algorithm>
 
 #define MAX_VERTS_PER_SUB_CHUNK 8000
 
@@ -44,7 +45,8 @@ static bool uploadMeshSafe(CraftPSPVertex *&dst, int &dstCount, int &dstCap,
 }
 
 ChunkRenderer::ChunkRenderer(TextureAtlas *atlas)
-    : m_level(nullptr), m_atlas(atlas), m_compileStep(0), m_compileChunk(nullptr), m_compileSy(-1) {}
+    : m_level(nullptr), m_atlas(atlas), m_compileStep(0), m_compileChunk(nullptr), m_compileSy(-1),
+      m_dirtyScanCursor(0) {}
 
 ChunkRenderer::~ChunkRenderer() {}
 
@@ -55,6 +57,9 @@ void ChunkRenderer::setLevel(Level *level) { m_level = level; }
 void ChunkRenderer::processCompileQueue(float camX, float camY, float camZ) {
   if (!m_level)
     return;
+  (void)camX;
+  (void)camY;
+  (void)camZ;
 
   // Limit compile time
   uint64_t tickStart;
@@ -70,38 +75,28 @@ void ChunkRenderer::processCompileQueue(float camX, float camY, float camZ) {
     }
 
   if (m_compileStep == 0) {
-    // Find closest dirty subchunk
-    Chunk *closestDirty = nullptr;
-    int closestDirtySy = -1;
-    float closestDirtyDistSq = 9999999.0f;
-
-    for (int cx = 0; cx < WORLD_CHUNKS_X; cx++) {
-      for (int cz = 0; cz < WORLD_CHUNKS_Z; cz++) {
-        Chunk *c = m_level->getChunk(cx, cz);
-        if (c) {
-          for (int sy = 0; sy < SUBCHUNK_COUNT; sy++) {
-            if (c->dirty[sy]) {
-              float chunkCenterX = c->cx * CHUNK_SIZE_X + CHUNK_SIZE_X / 2.0f;
-              float chunkCenterZ = c->cz * CHUNK_SIZE_Z + CHUNK_SIZE_Z / 2.0f;
-              float chunkCenterY = sy * 16 + 8.0f;
-              float dx = chunkCenterX - camX;
-              float dy = chunkCenterY - camY;
-              float dz = chunkCenterZ - camZ;
-              float distSq = dx * dx + dy * dy + dz * dz;
-              if (distSq < closestDirtyDistSq) {
-                closestDirtyDistSq = distSq;
-                closestDirty = c;
-                closestDirtySy = sy;
-              }
-            }
-          }
-        }
-      }
+    // anotherpspport-style round-robin dirty scan:
+    // avoid per-frame distance scoring over all subchunks.
+    const int totalSub = WORLD_CHUNKS_X * WORLD_CHUNKS_Z * SUBCHUNK_COUNT;
+    Chunk *picked = nullptr;
+    int pickedSy = -1;
+    for (int i = 0; i < totalSub; ++i) {
+      int idx = (m_dirtyScanCursor + i) % totalSub;
+      int sy = idx % SUBCHUNK_COUNT;
+      int tmp = idx / SUBCHUNK_COUNT;
+      int cz = tmp % WORLD_CHUNKS_Z;
+      int cx = tmp / WORLD_CHUNKS_Z;
+      Chunk *c = m_level->getChunk(cx, cz);
+      if (!c || !c->dirty[sy]) continue;
+      picked = c;
+      pickedSy = sy;
+      m_dirtyScanCursor = (idx + 1) % totalSub;
+      break;
     }
 
-    if (closestDirty) {
-      m_compileChunk = closestDirty;
-      m_compileSy = closestDirtySy;
+    if (picked) {
+      m_compileChunk = picked;
+      m_compileSy = pickedSy;
       m_compileStep = 1;
       m_opaqueTess.begin(g_opaqueBuf[m_compileSy], MAX_VERTS_PER_SUB_CHUNK);
       m_transTess.begin(g_transBuf[m_compileSy], MAX_VERTS_PER_SUB_CHUNK);
@@ -138,7 +133,8 @@ void ChunkRenderer::processCompileQueue(float camX, float camY, float camZ) {
 
     int newOpaque = m_opaqueTess.end();
     int newTrans = m_transTess.end();
-    int newFancy = m_transFancyTess.end();
+    (void)m_transFancyTess.end();
+    int newFancy = 0;
     int newEmit = m_emitTess.end();
     bool ok = true;
     ok &= uploadMeshSafe(c->opaqueVertices[sy], c->opaqueTriCount[sy], c->opaqueCapacity[sy], newOpaque, 250, g_opaqueBuf[sy]);
@@ -165,7 +161,8 @@ static void flushSubChunk(Chunk *c, int sy,
                           Tesselator &opT, Tesselator &trT, Tesselator &tfT, Tesselator &emT) {
   int newOpaque = opT.end();
   int newTrans = trT.end();
-  int newFancy = tfT.end();
+  (void)tfT.end();
+  int newFancy = 0;
   int newEmit = emT.end();
   bool ok = true;
   ok &= uploadMeshSafe(c->opaqueVertices[sy], c->opaqueTriCount[sy], c->opaqueCapacity[sy], newOpaque, 250, g_opaqueBuf[sy]);
@@ -216,10 +213,6 @@ void ChunkRenderer::render(float camX, float camY, float camZ) {
   frustum.update(vp);
 
   static const float RENDER_DISTANCE = 64.0f;
-  static const float FANCY_LOD_DIST = 32.0f; 
-
-
-
   struct RenderChunk {
     Chunk *chunk;
     int subChunkIdx;
@@ -284,16 +277,12 @@ void ChunkRenderer::render(float camX, float camY, float camZ) {
     }
   }
 
-  // Sort visible chunks front-to-back
-  for (int i = 0; i < visibleCount - 1; i++) {
-    for (int j = 0; j < visibleCount - i - 1; j++) {
-      if (visibleChunks[j].distSq > visibleChunks[j + 1].distSq) {
-        RenderChunk temp = visibleChunks[j];
-        visibleChunks[j] = visibleChunks[j + 1];
-        visibleChunks[j + 1] = temp;
-      }
-    }
-  }
+  // Sort visible chunks front-to-back.
+  // Use std::sort (n log n) instead of bubble sort (n^2).
+  std::sort(visibleChunks, visibleChunks + visibleCount,
+            [](const RenderChunk &a, const RenderChunk &b) {
+              return a.distSq < b.distSq;
+            });
 
   // Draw opaque chunks
   float sunBr = m_level->getSunBrightness();
@@ -346,17 +335,8 @@ void ChunkRenderer::render(float camX, float camY, float camZ) {
   sceGuEnable(GU_BLEND);
   sceGuDisable(GU_CULL_FACE); // Allow plants/water to be seen from both sides
 
-  for (int i = visibleCount - 1; i >= 0; i--) {
-    Chunk *c = visibleChunks[i].chunk;
-    int sy = visibleChunks[i].subChunkIdx;
-    if (c->transFancyTriCount[sy] == 0 || !c->transFancyVertices[sy]) continue;
-    float distSqHoriz = visibleChunks[i].distSqHoriz;
-    if (distSqHoriz > FANCY_LOD_DIST * FANCY_LOD_DIST || camY > 128.0f) continue;
-    setChunkMatrix(c);
-    sceGumDrawArray(GU_TRIANGLES,
-                    GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
-                    c->transFancyTriCount[sy], nullptr, c->transFancyVertices[sy]);
-  }
+  // anotherpspport-style simplification:
+  // skip separate fancy-transparent pass to reduce draw calls/state changes.
 
   // Draw transparent chunks (Back-to-Front)
   for (int i = visibleCount - 1; i >= 0; i--) {
