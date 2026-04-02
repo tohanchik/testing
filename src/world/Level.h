@@ -100,6 +100,10 @@ private:
   void recomputeBlockLightingFromSources();
   int getLightAttenuation(uint8_t blockId) const;
   void queueLightUpdate(int wx, int wy, int wz);
+  uint8_t computeExpectedBlockLightAt(int wx, int wy, int wz) const;
+  uint8_t computeExpectedSkyLightAt(int wx, int wy, int wz) const;
+  void propagateBlockLightFrom(int wx, int wy, int wz);
+  void propagateSkyLightFrom(int wx, int wy, int wz);
 
   Chunk *m_chunks[WORLD_CHUNKS_X][WORLD_CHUNKS_Z];
   std::vector<uint8_t> m_waterDepth;
@@ -130,4 +134,5 @@ private:
   bool m_inWaterSimUpdate = false;
   bool m_suspendLightingUpdates = false;
   std::deque<int> m_lightUpdateQueue;
+  std::vector<uint8_t> m_lightQueued;
 };

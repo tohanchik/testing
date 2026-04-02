@@ -40,6 +40,7 @@ void Level::tick() {
     while (processed < maxLightUpdatesPerTick && !m_lightUpdateQueue.empty()) {
       int idx = m_lightUpdateQueue.front();
       m_lightUpdateQueue.pop_front();
+      if (idx >= 0 && idx < (int)m_lightQueued.size()) m_lightQueued[idx] = 0;
       int x = idx % maxX;
       int tmp = idx / maxX;
       int z = tmp % maxZ;
@@ -382,6 +383,7 @@ Level::Level() {
   m_waterDue.resize(m_waterDepth.size(), -1);
   m_lavaDepth.resize(m_waterDepth.size(), 0xFF);
   m_lavaDue.resize(m_waterDepth.size(), -1);
+  m_lightQueued.resize(m_waterDepth.size(), 0);
   for (int cx = 0; cx < WORLD_CHUNKS_X; cx++)
     for (int cz = 0; cz < WORLD_CHUNKS_Z; cz++)
       m_chunks[cx][cz] = new Chunk();
@@ -736,6 +738,8 @@ bool Level::loadFromFile(const char *path) {
   }
   m_waterDirty = !m_waterTicks.empty();
   m_lavaDirty = !m_lavaTicks.empty();
+  m_lightUpdateQueue.clear();
+  std::fill(m_lightQueued.begin(), m_lightQueued.end(), 0);
   return true;
 }
 
@@ -743,6 +747,7 @@ void Level::generate(Random *rng) {
   int64_t seed = rng->nextLong();
   m_suspendLightingUpdates = true;
   m_lightUpdateQueue.clear();
+  std::fill(m_lightQueued.begin(), m_lightQueued.end(), 0);
 
   for (int cx = 0; cx < WORLD_CHUNKS_X; cx++) {
     for (int cz = 0; cz < WORLD_CHUNKS_Z; cz++) {
@@ -794,6 +799,7 @@ void Level::generate(Random *rng) {
 
   m_suspendLightingUpdates = false;
   m_lightUpdateQueue.clear();
+  std::fill(m_lightQueued.begin(), m_lightQueued.end(), 0);
   computeLighting();
 }
 
@@ -802,7 +808,11 @@ void Level::queueLightUpdate(int wx, int wy, int wz) {
   int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
   int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
   if (wx >= maxX || wz >= maxZ) return;
-  m_lightUpdateQueue.push_back(waterIndex(wx, wy, wz));
+  int idx = waterIndex(wx, wy, wz);
+  if (idx < 0 || idx >= (int)m_lightQueued.size()) return;
+  if (m_lightQueued[idx]) return;
+  m_lightQueued[idx] = 1;
+  m_lightUpdateQueue.push_back(idx);
 }
 
 void Level::computeLighting() {
@@ -885,50 +895,8 @@ void Level::computeLighting() {
 }
 
 void Level::updateLight(int wx, int wy, int wz) {
-  uint8_t id = getBlock(wx, wy, wz);
-  uint8_t oldBlockLight = getBlockLight(wx, wy, wz);
-  uint8_t newBlockLight = g_blockProps[id].light_emit;
-  
-  const int dx[] = {-1, 1, 0, 0, 0, 0};
-  const int dy[] = {0, 0, -1, 1, 0, 0};
-  const int dz[] = {0, 0, 0, 0, -1, 1};
-  
-  uint8_t maxNeighborLight = 0;
-  for(int i=0; i<6; i++) {
-    int nx = wx + dx[i];
-    int ny = wy + dy[i];
-    int nz = wz + dz[i];
-    if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= WORLD_CHUNKS_X * CHUNK_SIZE_X || nz >= WORLD_CHUNKS_Z * CHUNK_SIZE_Z) continue;
-    uint8_t nl = getBlockLight(nx, ny, nz);
-    if(nl > maxNeighborLight) maxNeighborLight = nl;
-  }
-  
-  uint8_t blockAtten = g_blockProps[id].isOpaque() ? 15 : ((id == BLOCK_LEAVES) ? 2 : (g_blockProps[id].isLiquid() ? 3 : 1));
-  uint8_t expectedBlockLight = newBlockLight;
-  if (maxNeighborLight > blockAtten && (maxNeighborLight - blockAtten) > expectedBlockLight) {
-      expectedBlockLight = maxNeighborLight - blockAtten;
-  }
-  updateBlockLight(wx, wy, wz, oldBlockLight, expectedBlockLight);
-
-  uint8_t oldSkyLight = getSkyLight(wx, wy, wz);
-  uint8_t expectedSkyLight = 0;
-  if (wy == CHUNK_SIZE_Y - 1) {
-      expectedSkyLight = blockAtten < 15 ? 15 : 0;
-  } else if (getSkyLight(wx, wy + 1, wz) == 15 && blockAtten < 15) {
-      expectedSkyLight = 15;
-  } else {
-      uint8_t maxNeighborSkyLight = 0;
-      for(int i=0; i<6; i++) {
-        int nx = wx + dx[i];
-        int ny = wy + dy[i];
-        int nz = wz + dz[i];
-        if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= WORLD_CHUNKS_X * CHUNK_SIZE_X || nz >= WORLD_CHUNKS_Z * CHUNK_SIZE_Z) continue;
-        uint8_t nl = getSkyLight(nx, ny, nz);
-        if(nl > maxNeighborSkyLight) maxNeighborSkyLight = nl;
-      }
-      if (maxNeighborSkyLight > blockAtten) expectedSkyLight = maxNeighborSkyLight - blockAtten;
-  }
-  updateSkyLight(wx, wy, wz, oldSkyLight, expectedSkyLight);
+  propagateBlockLightFrom(wx, wy, wz);
+  propagateSkyLightFrom(wx, wy, wz);
 }
 
 int Level::getLightAttenuation(uint8_t blockId) const {
@@ -994,128 +962,123 @@ void Level::recomputeBlockLightingFromSources() {
   }
 }
 
-void Level::updateBlockLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t newLight) {
-    (void)oldLight;
-    const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
-    const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
-    static const int dx[] = {-1, 1, 0, 0, 0, 0};
-    static const int dy[] = {0, 0, -1, 1, 0, 0};
-    static const int dz[] = {0, 0, 0, 0, -1, 1};
+uint8_t Level::computeExpectedBlockLightAt(int wx, int wy, int wz) const {
+  uint8_t id = getBlock(wx, wy, wz);
+  const BlockProps &bp = g_blockProps[id];
+  uint8_t target = bp.light_emit;
 
-    std::deque<LightNode> q;
-    const int maxQueued = 200000;
+  if (bp.isOpaque()) return target;
 
-    setBlockLight(wx, wy, wz, newLight);
-    q.push_back({wx, wy, wz});
-    for (int i = 0; i < 6; ++i) {
-      int nx = wx + dx[i], ny = wy + dy[i], nz = wz + dz[i];
-      if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= maxX || nz >= maxZ) continue;
-      q.push_back({nx, ny, nz});
+  static const int dx[] = {-1, 1, 0, 0, 0, 0};
+  static const int dy[] = {0, 0, -1, 1, 0, 0};
+  static const int dz[] = {0, 0, 0, 0, -1, 1};
+  const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
+  const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
+  int attenuation = getLightAttenuation(id);
+
+  for (int i = 0; i < 6; ++i) {
+    int nx = wx + dx[i], ny = wy + dy[i], nz = wz + dz[i];
+    if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= maxX || nz >= maxZ) continue;
+    uint8_t nl = getBlockLight(nx, ny, nz);
+    if (nl > (uint8_t)attenuation) {
+      uint8_t candidate = (uint8_t)(nl - attenuation);
+      if (candidate > target) target = candidate;
     }
-
-    while (!q.empty()) {
-      LightNode n = q.front();
-      q.pop_front();
-      uint8_t bid = getBlock(n.x, n.y, n.z);
-      const BlockProps &bp = g_blockProps[bid];
-      uint8_t cur = getBlockLight(n.x, n.y, n.z);
-      uint8_t target = bp.light_emit;
-
-      if (!bp.isOpaque()) {
-        int att = getLightAttenuation(bid);
-        for (int i = 0; i < 6; ++i) {
-          int nx = n.x + dx[i], ny = n.y + dy[i], nz = n.z + dz[i];
-          if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= maxX || nz >= maxZ) continue;
-          uint8_t nl = getBlockLight(nx, ny, nz);
-          if (nl > (uint8_t)att) {
-            uint8_t cand = (uint8_t)(nl - att);
-            if (cand > target) target = cand;
-          }
-        }
-      }
-
-      if (target == cur) continue;
-      setBlockLight(n.x, n.y, n.z, target);
-      for (int i = 0; i < 6; ++i) {
-        int nx = n.x + dx[i], ny = n.y + dy[i], nz = n.z + dz[i];
-        if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= maxX || nz >= maxZ) continue;
-        q.push_back({nx, ny, nz});
-      }
-
-      // Safety valve for low-memory PSP: fall back to authoritative rebuild
-      // instead of growing an unbounded local queue.
-      if ((int)q.size() > maxQueued) {
-        recomputeBlockLightingFromSources();
-        return;
-      }
-    }
+  }
+  return target;
 }
 
-struct LightRemovalNode {
-    short x, y, z;
-    uint8_t val;
-};
+uint8_t Level::computeExpectedSkyLightAt(int wx, int wy, int wz) const {
+  uint8_t id = getBlock(wx, wy, wz);
+  int attenuation = getLightAttenuation(id);
+  if (attenuation >= 15) return 0;
+
+  if (wy == CHUNK_SIZE_Y - 1) return 15;
+  if (getSkyLight(wx, wy + 1, wz) == 15) return 15;
+
+  static const int dx[] = {-1, 1, 0, 0, 0, 0};
+  static const int dy[] = {0, 0, -1, 1, 0, 0};
+  static const int dz[] = {0, 0, 0, 0, -1, 1};
+  const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
+  const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
+
+  uint8_t target = 0;
+  for (int i = 0; i < 6; ++i) {
+    int nx = wx + dx[i], ny = wy + dy[i], nz = wz + dz[i];
+    if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= maxX || nz >= maxZ) continue;
+    uint8_t nl = getSkyLight(nx, ny, nz);
+    if (nl > (uint8_t)attenuation) {
+      uint8_t candidate = (uint8_t)(nl - attenuation);
+      if (candidate > target) target = candidate;
+    }
+  }
+  return target;
+}
+
+void Level::propagateBlockLightFrom(int wx, int wy, int wz) {
+  static const int dx[] = {-1, 1, 0, 0, 0, 0};
+  static const int dy[] = {0, 0, -1, 1, 0, 0};
+  static const int dz[] = {0, 0, 0, 0, -1, 1};
+  const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
+  const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
+
+  std::deque<LightNode> q;
+  q.push_back({wx, wy, wz});
+  for (int i = 0; i < 6; ++i) q.push_back({wx + dx[i], wy + dy[i], wz + dz[i]});
+
+  int steps = 0;
+  const int maxSteps = 300000;
+  while (!q.empty() && steps < maxSteps) {
+    LightNode n = q.front();
+    q.pop_front();
+    steps++;
+
+    if (n.y < 0 || n.y >= CHUNK_SIZE_Y || n.x < 0 || n.z < 0 || n.x >= maxX || n.z >= maxZ) continue;
+    uint8_t expected = computeExpectedBlockLightAt(n.x, n.y, n.z);
+    uint8_t current = getBlockLight(n.x, n.y, n.z);
+    if (expected == current) continue;
+
+    setBlockLight(n.x, n.y, n.z, expected);
+    for (int i = 0; i < 6; ++i) q.push_back({n.x + dx[i], n.y + dy[i], n.z + dz[i]});
+  }
+}
+
+void Level::propagateSkyLightFrom(int wx, int wy, int wz) {
+  static const int dx[] = {-1, 1, 0, 0, 0, 0};
+  static const int dy[] = {0, 0, -1, 1, 0, 0};
+  static const int dz[] = {0, 0, 0, 0, -1, 1};
+  const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
+  const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
+
+  std::deque<LightNode> q;
+  q.push_back({wx, wy, wz});
+  for (int i = 0; i < 6; ++i) q.push_back({wx + dx[i], wy + dy[i], wz + dz[i]});
+
+  int steps = 0;
+  const int maxSteps = 300000;
+  while (!q.empty() && steps < maxSteps) {
+    LightNode n = q.front();
+    q.pop_front();
+    steps++;
+
+    if (n.y < 0 || n.y >= CHUNK_SIZE_Y || n.x < 0 || n.z < 0 || n.x >= maxX || n.z >= maxZ) continue;
+    uint8_t expected = computeExpectedSkyLightAt(n.x, n.y, n.z);
+    uint8_t current = getSkyLight(n.x, n.y, n.z);
+    if (expected == current) continue;
+
+    setSkyLight(n.x, n.y, n.z, expected);
+    for (int i = 0; i < 6; ++i) q.push_back({n.x + dx[i], n.y + dy[i], n.z + dz[i]});
+  }
+}
+
+void Level::updateBlockLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t newLight) {
+  (void)oldLight;
+  (void)newLight;
+  propagateBlockLightFrom(wx, wy, wz);
+}
 
 void Level::updateSkyLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t newLight) {
-    if (oldLight == newLight) return;
-
-    std::deque<LightRemovalNode> darkQ;
-    std::deque<LightNode> lightQ;
-
-    const int dx[] = {-1, 1, 0, 0, 0, 0};
-    const int dy[] = {0, 0, -1, 1, 0, 0};
-    const int dz[] = {0, 0, 0, 0, -1, 1};
-
-    if (oldLight > newLight) {
-        darkQ.push_back({(short)wx, (short)wy, (short)wz, oldLight});
-        setSkyLight(wx, wy, wz, 0);
-    } else {
-        lightQ.push_back({wx, wy, wz});
-        setSkyLight(wx, wy, wz, newLight);
-    }
-
-    while (!darkQ.empty()) {
-        LightRemovalNode node = darkQ.front();
-        darkQ.pop_front();
-        int x = node.x, y = node.y, z = node.z;
-        uint8_t level = node.val;
-
-        for (int i = 0; i < 6; i++) {
-            int nx = x + dx[i], ny = y + dy[i], nz = z + dz[i];
-            if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= WORLD_CHUNKS_X * CHUNK_SIZE_X || nz >= WORLD_CHUNKS_Z * CHUNK_SIZE_Z) continue;
-            
-            uint8_t neighborLevel = getSkyLight(nx, ny, nz);
-            
-            if (neighborLevel != 0 && ((dy[i] == -1 && level == 15 && neighborLevel == 15) || neighborLevel < level)) {
-                setSkyLight(nx, ny, nz, 0);
-                darkQ.push_back({(short)nx, (short)ny, (short)nz, neighborLevel});
-            } else if (neighborLevel >= level) {
-                lightQ.push_back({nx, ny, nz});
-            }
-        }
-    }
-
-    while (!lightQ.empty()) {
-        LightNode node = lightQ.front();
-        lightQ.pop_front();
-        int x = node.x, y = node.y, z = node.z;
-        uint8_t level = getSkyLight(x, y, z);
-        
-        for (int i = 0; i < 6; i++) {
-            int nx = x + dx[i], ny = y + dy[i], nz = z + dz[i];
-            if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= WORLD_CHUNKS_X * CHUNK_SIZE_X || nz >= WORLD_CHUNKS_Z * CHUNK_SIZE_Z) continue;
-            
-            uint8_t id = getBlock(nx, ny, nz);
-            const BlockProps& bp = g_blockProps[id];
-            
-            int attenuation = bp.isOpaque() ? 15 : ((id == BLOCK_LEAVES) ? 2 : (bp.isLiquid() ? 3 : 1));
-            if (dy[i] == -1 && level == 15 && attenuation < 15) attenuation = 0;
-            
-            int neighborLevel = getSkyLight(nx, ny, nz);
-            if (level - attenuation > neighborLevel) {
-                setSkyLight(nx, ny, nz, level - attenuation);
-                lightQ.push_back({nx, ny, nz});
-            }
-        }
-    }
+  (void)oldLight;
+  (void)newLight;
+  propagateSkyLightFrom(wx, wy, wz);
 }
