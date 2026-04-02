@@ -32,21 +32,11 @@ void Level::tick() {
   m_time += 1;
   if (m_waterDirty) tickWater();
   if (m_lavaDirty) tickLava();
-  if (!m_suspendLightingUpdates && !m_lightUpdateQueue.empty()) {
-    const int maxLightUpdatesPerTick = 24;
-    int processed = 0;
-    const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
-    const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
-    while (processed < maxLightUpdatesPerTick && !m_lightUpdateQueue.empty()) {
-      int idx = m_lightUpdateQueue.front();
-      m_lightUpdateQueue.pop_front();
-      int x = idx % maxX;
-      int tmp = idx / maxX;
-      int z = tmp % maxZ;
-      int y = tmp / maxZ;
-      if (y >= 0 && y < CHUNK_SIZE_Y) updateLight(x, y, z);
-      processed++;
-    }
+  if (!m_suspendLightingUpdates && m_fullRelightPending) {
+    m_lightUpdateQueue.clear();
+    std::fill(m_lightQueued.begin(), m_lightQueued.end(), 0);
+    computeLighting();
+    m_fullRelightPending = false;
   }
   if (m_waterWakeTicks > 0) m_waterWakeTicks--;
   if (m_lavaWakeTicks > 0) m_lavaWakeTicks--;
@@ -382,6 +372,7 @@ Level::Level() {
   m_waterDue.resize(m_waterDepth.size(), -1);
   m_lavaDepth.resize(m_waterDepth.size(), 0xFF);
   m_lavaDue.resize(m_waterDepth.size(), -1);
+  m_lightQueued.resize(m_waterDepth.size(), 0);
   for (int cx = 0; cx < WORLD_CHUNKS_X; cx++)
     for (int cz = 0; cz < WORLD_CHUNKS_Z; cz++)
       m_chunks[cx][cz] = new Chunk();
@@ -549,13 +540,9 @@ void Level::setBlock(int wx, int wy, int wz, uint8_t id) {
   }
 
   if (m_suspendLightingUpdates || m_inWaterSimUpdate) {
-    queueLightUpdate(wx, wy, wz);
-    static const int dx[6] = {-1, 1, 0, 0, 0, 0};
-    static const int dy[6] = {0, 0, -1, 1, 0, 0};
-    static const int dz[6] = {0, 0, 0, 0, -1, 1};
-    for (int i = 0; i < 6; ++i) queueLightUpdate(wx + dx[i], wy + dy[i], wz + dz[i]);
+    m_fullRelightPending = true;
   } else {
-    updateLight(wx, wy, wz);
+    m_fullRelightPending = true;
   }
 }
 
@@ -720,6 +707,9 @@ bool Level::loadFromFile(const char *path) {
   while (!m_lavaTicks.empty()) m_lavaTicks.pop();
   std::fill(m_waterDue.begin(), m_waterDue.end(), -1);
   std::fill(m_lavaDue.begin(), m_lavaDue.end(), -1);
+  m_lightUpdateQueue.clear();
+  std::fill(m_lightQueued.begin(), m_lightQueued.end(), 0);
+  m_fullRelightPending = false;
   for (int y = 0; y < CHUNK_SIZE_Y; ++y) {
     for (int z = 0; z < WORLD_CHUNKS_Z * CHUNK_SIZE_Z; ++z) {
       for (int x = 0; x < WORLD_CHUNKS_X * CHUNK_SIZE_X; ++x) {
@@ -743,6 +733,7 @@ void Level::generate(Random *rng) {
   int64_t seed = rng->nextLong();
   m_suspendLightingUpdates = true;
   m_lightUpdateQueue.clear();
+  std::fill(m_lightQueued.begin(), m_lightQueued.end(), 0);
 
   for (int cx = 0; cx < WORLD_CHUNKS_X; cx++) {
     for (int cz = 0; cz < WORLD_CHUNKS_Z; cz++) {
@@ -794,6 +785,8 @@ void Level::generate(Random *rng) {
 
   m_suspendLightingUpdates = false;
   m_lightUpdateQueue.clear();
+  std::fill(m_lightQueued.begin(), m_lightQueued.end(), 0);
+  m_fullRelightPending = false;
   computeLighting();
 }
 
@@ -802,7 +795,23 @@ void Level::queueLightUpdate(int wx, int wy, int wz) {
   int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
   int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
   if (wx >= maxX || wz >= maxZ) return;
-  m_lightUpdateQueue.push_back(waterIndex(wx, wy, wz));
+  int idx = waterIndex(wx, wy, wz);
+  if (idx < 0 || idx >= (int)m_lightQueued.size()) return;
+  if (m_lightQueued[idx]) return;
+  m_lightQueued[idx] = 1;
+  m_lightUpdateQueue.push_back(idx);
+}
+
+bool Level::popQueuedLightUpdate(int &idx) {
+  while (!m_lightUpdateQueue.empty()) {
+    idx = m_lightUpdateQueue.front();
+    m_lightUpdateQueue.pop_front();
+    if (idx < 0 || idx >= (int)m_lightQueued.size()) continue;
+    if (!m_lightQueued[idx]) continue;
+    m_lightQueued[idx] = 0;
+    return true;
+  }
+  return false;
 }
 
 void Level::computeLighting() {
@@ -1013,7 +1022,13 @@ void Level::updateBlockLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t n
       q.push_back({nx, ny, nz});
     }
 
+    int propagationSteps = 0;
+    const int maxPropagationSteps = 40000;
     while (!q.empty()) {
+      if (++propagationSteps > maxPropagationSteps) {
+        computeLighting();
+        return;
+      }
       LightNode n = q.front();
       q.pop_front();
       uint8_t bid = getBlock(n.x, n.y, n.z);
@@ -1074,7 +1089,14 @@ void Level::updateSkyLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t new
         setSkyLight(wx, wy, wz, newLight);
     }
 
+    int propagationSteps = 0;
+    const int maxPropagationSteps = 50000;
+
     while (!darkQ.empty()) {
+        if (++propagationSteps > maxPropagationSteps) {
+            computeLighting();
+            return;
+        }
         LightRemovalNode node = darkQ.front();
         darkQ.pop_front();
         int x = node.x, y = node.y, z = node.z;
@@ -1096,6 +1118,10 @@ void Level::updateSkyLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t new
     }
 
     while (!lightQ.empty()) {
+        if (++propagationSteps > maxPropagationSteps) {
+            computeLighting();
+            return;
+        }
         LightNode node = lightQ.front();
         lightQ.pop_front();
         int x = node.x, y = node.y, z = node.z;
