@@ -100,6 +100,8 @@ private:
   void recomputeBlockLightingFromSources();
   int getLightAttenuation(uint8_t blockId) const;
   void queueLightUpdate(int wx, int wy, int wz);
+  bool popQueuedLightUpdate(int &idx);
+  void requestFullRelight(int debounceTicks);
 
   Chunk *m_chunks[WORLD_CHUNKS_X][WORLD_CHUNKS_Z];
   std::vector<uint8_t> m_waterDepth;
@@ -129,5 +131,9 @@ private:
   int m_lavaWakeTicks = 0;
   bool m_inWaterSimUpdate = false;
   bool m_suspendLightingUpdates = false;
+  bool m_fullRelightPending = false;
+  int m_relightDebounceTicks = 0;
+  int m_relightCooldownTicks = 0;
   std::deque<int> m_lightUpdateQueue;
+  std::vector<uint8_t> m_lightQueued;
 };
