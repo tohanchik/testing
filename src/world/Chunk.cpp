@@ -71,7 +71,9 @@ uint8_t Chunk::getBlockLight(int x, int y, int z) const {
 void Chunk::setLight(int x, int y, int z, uint8_t sky, uint8_t block) {
   if (x < 0 || x >= CHUNK_SIZE_X || y < 0 || y >= CHUNK_SIZE_Y || z < 0 || z >= CHUNK_SIZE_Z)
     return;
-  light[x][z][y] = ((sky & 0x0F) << 4) | (block & 0x0F);
+  uint8_t packed = ((sky & 0x0F) << 4) | (block & 0x0F);
+  if (light[x][z][y] == packed) return;
+  light[x][z][y] = packed;
   int sy = y / 16;
   dirty[sy] = true;
   if (y % 16 == 0 && sy > 0) dirty[sy - 1] = true;
