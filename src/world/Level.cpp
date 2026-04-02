@@ -28,24 +28,24 @@ void Level::setSimulationFocus(int wx, int wy, int wz, int radius) {
   m_simFocusRadius = radius;
 }
 
+void Level::requestFullRelight(int debounceTicks) {
+  m_fullRelightPending = true;
+  if (debounceTicks > m_relightDebounceTicks) m_relightDebounceTicks = debounceTicks;
+}
+
 void Level::tick() {
   m_time += 1;
   if (m_waterDirty) tickWater();
   if (m_lavaDirty) tickLava();
-  if (!m_suspendLightingUpdates && !m_lightUpdateQueue.empty()) {
-    const int maxLightUpdatesPerTick = 24;
-    int processed = 0;
-    const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
-    const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
-    while (processed < maxLightUpdatesPerTick && !m_lightUpdateQueue.empty()) {
-      int idx = m_lightUpdateQueue.front();
-      m_lightUpdateQueue.pop_front();
-      int x = idx % maxX;
-      int tmp = idx / maxX;
-      int z = tmp % maxZ;
-      int y = tmp / maxZ;
-      if (y >= 0 && y < CHUNK_SIZE_Y) updateLight(x, y, z);
-      processed++;
+  if (m_relightCooldownTicks > 0) m_relightCooldownTicks--;
+  if (m_relightDebounceTicks > 0) m_relightDebounceTicks--;
+  if (!m_suspendLightingUpdates && m_fullRelightPending) {
+    if (m_relightDebounceTicks > 0 || m_relightCooldownTicks > 0) {
+      // Coalesce many block/fluid edits into one relight and cap relight rate.
+    } else {
+      computeLighting();
+      m_fullRelightPending = false;
+      m_relightCooldownTicks = 4;
     }
   }
   if (m_waterWakeTicks > 0) m_waterWakeTicks--;
@@ -548,14 +548,20 @@ void Level::setBlock(int wx, int wy, int wz, uint8_t id) {
     }
   }
 
-  if (m_suspendLightingUpdates || m_inWaterSimUpdate) {
-    queueLightUpdate(wx, wy, wz);
-    static const int dx[6] = {-1, 1, 0, 0, 0, 0};
-    static const int dy[6] = {0, 0, -1, 1, 0, 0};
-    static const int dz[6] = {0, 0, 0, 0, -1, 1};
-    for (int i = 0; i < 6; ++i) queueLightUpdate(wx + dx[i], wy + dy[i], wz + dz[i]);
-  } else {
-    updateLight(wx, wy, wz);
+  uint8_t oldEmit = g_blockProps[oldId].light_emit;
+  uint8_t newEmit = g_blockProps[id].light_emit;
+  int oldAtt = getLightAttenuation(oldId);
+  int newAtt = getLightAttenuation(id);
+  bool bothLiquids = g_blockProps[oldId].isLiquid() && g_blockProps[id].isLiquid();
+  bool lightingAffectingChange = (oldEmit != newEmit) || (oldAtt != newAtt);
+  if (bothLiquids && oldEmit == newEmit) lightingAffectingChange = false;
+  if (lightingAffectingChange) {
+    // Fluid simulation can touch many cells per tick; debounce avoids relighting
+    // every frame while still converging quickly.
+    int debounce = 1;
+    if (m_inWaterSimUpdate) debounce = 8;
+    else if (g_blockProps[oldId].isLiquid() || g_blockProps[id].isLiquid()) debounce = 4;
+    requestFullRelight(debounce);
   }
 }
 
@@ -720,6 +726,9 @@ bool Level::loadFromFile(const char *path) {
   while (!m_lavaTicks.empty()) m_lavaTicks.pop();
   std::fill(m_waterDue.begin(), m_waterDue.end(), -1);
   std::fill(m_lavaDue.begin(), m_lavaDue.end(), -1);
+  m_fullRelightPending = false;
+  m_relightDebounceTicks = 0;
+  m_relightCooldownTicks = 0;
   for (int y = 0; y < CHUNK_SIZE_Y; ++y) {
     for (int z = 0; z < WORLD_CHUNKS_Z * CHUNK_SIZE_Z; ++z) {
       for (int x = 0; x < WORLD_CHUNKS_X * CHUNK_SIZE_X; ++x) {
@@ -742,7 +751,6 @@ bool Level::loadFromFile(const char *path) {
 void Level::generate(Random *rng) {
   int64_t seed = rng->nextLong();
   m_suspendLightingUpdates = true;
-  m_lightUpdateQueue.clear();
 
   for (int cx = 0; cx < WORLD_CHUNKS_X; cx++) {
     for (int cz = 0; cz < WORLD_CHUNKS_Z; cz++) {
@@ -793,16 +801,10 @@ void Level::generate(Random *rng) {
   std::fill(m_lavaDue.begin(), m_lavaDue.end(), -1);
 
   m_suspendLightingUpdates = false;
-  m_lightUpdateQueue.clear();
+  m_fullRelightPending = false;
+  m_relightDebounceTicks = 0;
+  m_relightCooldownTicks = 0;
   computeLighting();
-}
-
-void Level::queueLightUpdate(int wx, int wy, int wz) {
-  if (wx < 0 || wz < 0 || wy < 0 || wy >= CHUNK_SIZE_Y) return;
-  int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
-  int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
-  if (wx >= maxX || wz >= maxZ) return;
-  m_lightUpdateQueue.push_back(waterIndex(wx, wy, wz));
 }
 
 void Level::computeLighting() {
@@ -939,56 +941,71 @@ int Level::getLightAttenuation(uint8_t blockId) const {
 }
 
 void Level::recomputeBlockLightingFromSources() {
-  std::vector<LightNode> lightQ;
-  lightQ.reserve(65536);
+  // anotherpspport-style local torch propagation:
+  // - clear channel
+  // - for each emissive block, spread in a bounded Manhattan radius
+  // This trades long global floods for predictable, stable local updates.
+  const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
+  const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
+  static const int dx[] = {-1, 1, 0, 0, 0, 0};
+  static const int dy[] = {0, 0, -1, 1, 0, 0};
+  static const int dz[] = {0, 0, 0, 0, -1, 1};
 
-  // Reset block-light channel and seed every emissive block from BlockProps.
-  for (int cx = 0; cx < WORLD_CHUNKS_X; cx++) {
-    for (int cz = 0; cz < WORLD_CHUNKS_Z; cz++) {
-      for (int lx = 0; lx < CHUNK_SIZE_X; lx++) {
-        for (int lz = 0; lz < CHUNK_SIZE_Z; lz++) {
-          for (int ly = 0; ly < CHUNK_SIZE_Y; ly++) {
+  for (int y = 0; y < CHUNK_SIZE_Y; ++y) {
+    for (int z = 0; z < maxZ; ++z) {
+      for (int x = 0; x < maxX; ++x) {
+        setBlockLight(x, y, z, 0);
+      }
+    }
+  }
+
+  struct TorchNode {
+    short x, y, z;
+    uint8_t level;
+    uint8_t steps;
+  };
+
+  std::deque<TorchNode> q;
+  const int maxQueue = 131072;
+  const int maxTorchSteps = 10; // mirrors anotherpspport LightTravel(..., 10, ...)
+
+  for (int cx = 0; cx < WORLD_CHUNKS_X; ++cx) {
+    for (int cz = 0; cz < WORLD_CHUNKS_Z; ++cz) {
+      for (int lx = 0; lx < CHUNK_SIZE_X; ++lx) {
+        for (int lz = 0; lz < CHUNK_SIZE_Z; ++lz) {
+          for (int ly = 0; ly < CHUNK_SIZE_Y; ++ly) {
             int wx = cx * CHUNK_SIZE_X + lx;
             int wz = cz * CHUNK_SIZE_Z + lz;
             uint8_t id = m_chunks[cx][cz]->blocks[lx][lz][ly];
             uint8_t emit = g_blockProps[id].light_emit;
+            if (emit == 0) continue;
             setBlockLight(wx, ly, wz, emit);
-            if (emit > 1) lightQ.push_back({wx, ly, wz});
+            if (emit > 1) q.push_back({(short)wx, (short)ly, (short)wz, emit, 0});
           }
         }
       }
     }
   }
 
-  int head = 0;
-  static const int dx[] = {-1, 1, 0, 0, 0, 0};
-  static const int dy[] = {0, 0, -1, 1, 0, 0};
-  static const int dz[] = {0, 0, 0, 0, -1, 1};
-  const int maxX = WORLD_CHUNKS_X * CHUNK_SIZE_X;
-  const int maxZ = WORLD_CHUNKS_Z * CHUNK_SIZE_Z;
+  while (!q.empty()) {
+    TorchNode n = q.front();
+    q.pop_front();
+    if (n.level <= 1 || n.steps >= maxTorchSteps) continue;
 
-  while (head < (int)lightQ.size()) {
-    LightNode node = lightQ[head++];
-    uint8_t level = getBlockLight(node.x, node.y, node.z);
-    if (level <= 1) continue;
-
-    for (int i = 0; i < 6; i++) {
-      int nx = node.x + dx[i];
-      int ny = node.y + dy[i];
-      int nz = node.z + dz[i];
+    for (int i = 0; i < 6; ++i) {
+      int nx = n.x + dx[i];
+      int ny = n.y + dy[i];
+      int nz = n.z + dz[i];
       if (ny < 0 || ny >= CHUNK_SIZE_Y || nx < 0 || nz < 0 || nx >= maxX || nz >= maxZ) continue;
 
-      uint8_t neighborId = getBlock(nx, ny, nz);
-      if (g_blockProps[neighborId].isOpaque()) continue;
+      uint8_t nid = getBlock(nx, ny, nz);
+      if (g_blockProps[nid].isOpaque()) continue;
 
-      int attenuation = getLightAttenuation(neighborId);
-      int propagated = (int)level - attenuation;
-      if (propagated <= 0) continue;
-
-      uint8_t neighborLevel = getBlockLight(nx, ny, nz);
-      if (propagated > neighborLevel) {
-        setBlockLight(nx, ny, nz, (uint8_t)propagated);
-        lightQ.push_back({nx, ny, nz});
+      uint8_t nextLevel = (n.level > 1) ? (uint8_t)(n.level - 1) : 0;
+      if (nextLevel <= getBlockLight(nx, ny, nz)) continue;
+      setBlockLight(nx, ny, nz, nextLevel);
+      if ((int)q.size() < maxQueue) {
+        q.push_back({(short)nx, (short)ny, (short)nz, nextLevel, (uint8_t)(n.steps + 1)});
       }
     }
   }
@@ -1013,7 +1030,13 @@ void Level::updateBlockLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t n
       q.push_back({nx, ny, nz});
     }
 
+    int propagationSteps = 0;
+    const int maxPropagationSteps = 40000;
     while (!q.empty()) {
+      if (++propagationSteps > maxPropagationSteps) {
+        computeLighting();
+        return;
+      }
       LightNode n = q.front();
       q.pop_front();
       uint8_t bid = getBlock(n.x, n.y, n.z);
@@ -1074,7 +1097,14 @@ void Level::updateSkyLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t new
         setSkyLight(wx, wy, wz, newLight);
     }
 
+    int propagationSteps = 0;
+    const int maxPropagationSteps = 50000;
+
     while (!darkQ.empty()) {
+        if (++propagationSteps > maxPropagationSteps) {
+            computeLighting();
+            return;
+        }
         LightRemovalNode node = darkQ.front();
         darkQ.pop_front();
         int x = node.x, y = node.y, z = node.z;
@@ -1096,6 +1126,10 @@ void Level::updateSkyLight(int wx, int wy, int wz, uint8_t oldLight, uint8_t new
     }
 
     while (!lightQ.empty()) {
+        if (++propagationSteps > maxPropagationSteps) {
+            computeLighting();
+            return;
+        }
         LightNode node = lightQ.front();
         lightQ.pop_front();
         int x = node.x, y = node.y, z = node.z;
